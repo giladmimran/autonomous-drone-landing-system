@@ -1,0 +1,7 @@
+# Computer Vision Layer
+opencv-contrib-python>=4.8.0
+numpy>=1.22.0
+
+# MAVLink & Serial Communication Layer
+pymavlink>=2.4.40
+pyserial>=3.5
