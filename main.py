@@ -4,6 +4,7 @@ import time
 import os
 import csv
 from collections import deque
+from picamera2 import Picamera2
 from drone_control import DroneTelemetry
 
 # --- Configuration Constants ---
@@ -69,16 +70,13 @@ def main():
         print(f"FC Connection Failed: {e}")
         drone = None
 
-    cap = cv2.VideoCapture(0)
-    
-    # FIX: Safety check for camera opening
-    if not cap.isOpened():
-        print("CRITICAL ERROR: Could not open camera.")
-        if drone: drone.stop()
-        return
-        
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    # FIX: Raspberry Pi CSI camera initialization using Picamera2
+    picam2 = Picamera2()
+    camera_config = picam2.create_preview_configuration(
+        main={"size": (640, 480), "format": "RGB888"})
+    picam2.configure(camera_config)
+    picam2.start()
+    time.sleep(1.0)  # Allow the camera to warm up
     
     aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
     detector = cv2.aruco.ArucoDetector(aruco_dict, cv2.aruco.DetectorParameters())
@@ -86,7 +84,7 @@ def main():
     # FIX: Mandatory calibration data load, graceful exit if missing
     if not os.path.exists('calib_data.npz'):
         print("CRITICAL ERROR: 'calib_data.npz' not found! Please run camera_calibration.py first.")
-        cap.release()
+        picam2.stop()
         if drone: drone.stop()
         return
         
@@ -104,8 +102,8 @@ def main():
     # FIX: Wrapped the entire main loop in a try/finally block to ensure clean resource release
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret: 
+            frame = picam2.capture_array()
+            if frame is None or frame.size == 0:
                 print("Video stream error.")
                 break
 
@@ -207,7 +205,7 @@ def main():
 
     finally:
         # FIX: Ensure resources are released completely even on crash
-        cap.release()
+        picam2.stop()
         cv2.destroyAllWindows()
         if drone: drone.stop()
         print("System shutdown cleanly.")
