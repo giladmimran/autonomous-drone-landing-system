@@ -1,5 +1,5 @@
 # Computer Vision Layer
-opencv-contrib-python>=4.8.0
+opencv-python>=4.8.0
 numpy>=1.22.0
 
 # MAVLink & Serial Communication Layer

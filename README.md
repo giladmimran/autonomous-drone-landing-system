@@ -1,276 +1,167 @@
-# Vision-Based Autonomous Landing System for UAVs
+# Single-camera IR beacon landing project
 
-A proof-of-concept autonomous landing system for a quadcopter using onboard computer vision, ArUco marker detection, pose estimation, and MAVLink communication with an ArduPilot-based flight controller.
+The active application uses one OV5647 camera on Raspberry Pi 5 and one landing-pad
+array of 20 LEDs blinking together. One capture stream feeds Morse identification
+and beacon tracking. The reported roughly 50 m detection is an observation under
+the user's conditions, not a guaranteed decoding or landing range.
 
-<p align="center">
-  <img src="media/uav_platform.png" alt="Autonomous landing UAV platform" width="850">
-</p>
+**Development version: no flight-command path exists in the active application.**
+RTL and precision landing are dry-run only. Human detection remains independent;
+`~/human_detection_system/human_detection_gps.py` is not modified.
 
-The project was developed as a final-year Electrical Engineering project at **Afeka – Tel Aviv Academic College of Engineering**. Its goal is to demonstrate a low-cost, onboard approach for autonomous UAV landing in environments where GPS/GNSS may be unavailable, degraded, or unreliable.
+## Architecture
 
----
+* `main.py`: simulation/camera entry point and structured observation logging.
+* `config.py`: expected message, Morse timing and confirmation policy.
+* `ir/ir_camera_receiver.py`: exactly-one-OV5647 enumeration, fixed exposure/gain,
+  sensor timestamps, frame continuity checks and diagnostic preview.
+* `ir/ir_detector.py`: candidate bright-region cluster, aggregate centroid,
+  intensity/background contrast, ON history and OFF-period prediction.
+* `ir/morse_decoder.py`: strict duration decoding; UNKNOWN invalidates a frame.
+* `ir/signal_validator.py`: full-message match, repeated confirmation, cooldown
+  and one accepted request per process session. Disconnection does not rearm it.
+* `pixhawk/pixhawk_interface.py`: optional passive, explicitly addressed telemetry.
+* `pixhawk/rtl_controller.py`: logged hypothetical decision only.
+* `landing/precision_landing.py`: calibrated camera ray helper and disabled target
+  preparation skeleton. No LANDING_TARGET transmissions.
 
-## Demo & Flight Test
+ArUco detection, IDs, pose estimation, centering and automatic LAND/LOITER decisions
+have been removed from the active entry point. `requirements.txt` no longer needs
+`opencv-contrib-python`. General checkerboard calibration utilities are preserved.
+`legacy/aruco_main.py` and `legacy/README_aruco.md` preserve the original work for
+reference; **do not run the legacy flight script**. Original `drone_control.py`
+still contains commands and is never imported by the new application. Marker PDF
+and historical media are retained but are not required.
 
-The complete system was integrated on an F450 quadcopter and tested in real outdoor flight conditions. During the autonomous landing tests, the onboard vision system detected the landing marker, estimated its relative position, and provided landing-target information to the flight controller through MAVLink.
+## Installation
 
-<p align="center">
-  <a href="media/autonomous_landing_demo.mp4">
-    <img src="media/landing_gui.png" alt="Autonomous landing GUI during precision approach" width="700">
-  </a>
-</p>
+Simulation and protocol tests need only Python's standard library:
 
-**[▶ Watch the autonomous landing demo](media/autonomous_landing_demo.mp4)**
-
-The GUI shown above provides real-time visibility into the landing process, including:
-
-- current landing state
-- flight-controller altitude telemetry
-- vision-estimated distance to the target using PnP
-- normalized X/Y positioning error
-- detection confidence
-- processing frame rate (FPS)
-- telemetry validity
-
-> The video shows one of the real autonomous landing tests performed during project validation. No formal landing-accuracy figure is claimed here; the project focused on demonstrating the complete perception-to-flight-control pipeline in real operation.
-
----
-
-## Project Overview
-
-Manual UAV landing can become difficult in GPS-denied environments, communication-limited areas, or situations with poor operator visibility. High-accuracy alternatives such as RTK-GPS and LiDAR can add cost, weight, infrastructure requirements, or integration complexity.
-
-This project explores a self-contained vision-based alternative built around:
-
-- **Raspberry Pi 4** companion computer
-- downward-facing **RGB camera**
-- **OpenCV** image processing
-- **ArUco** visual markers
-- camera calibration using a checkerboard target
-- **Perspective-n-Point (PnP)** pose estimation
-- **MAVLink** communication with the flight controller
-- real-time telemetry validation
-- state-based landing logic and fail-safe handling
-- CSV flight-data logging for post-test analysis
-
----
-
-## System Architecture
-
-The system is divided into three main functional layers:
-
-### 1. Vision Sensing
-A downward-facing camera captures the landing area. OpenCV detects the ArUco marker and extracts its image-space corner coordinates.
-
-### 2. Onboard Processing
-The Raspberry Pi processes the camera stream, loads the calibrated camera parameters, solves the PnP problem, estimates the target position relative to the camera, evaluates detection confidence, and computes the normalized lateral error.
-
-### 3. Flight-Control Communication
-The Raspberry Pi communicates with the CrossFlight/ArduPilot flight controller over UART using MAVLink. Landing-target information is transmitted to the flight controller while altitude telemetry is received in parallel.
-
-```text
-             ArUco Landing Marker
-                      │
-                      ▼
-            Downward-Facing Camera
-                      │
-                      ▼
-              Raspberry Pi 4
-        ┌───────────────────────────┐
-        │ Camera Calibration        │
-        │ ArUco Detection           │
-        │ PnP Pose Estimation       │
-        │ Confidence Validation     │
-        │ X/Y Error Calculation     │
-        │ Landing State Machine     │
-        └───────────────────────────┘
-                      │
-                MAVLink / UART
-                      │
-                      ▼
-          CrossFlight / ArduPilot
-                      │
-                      ▼
-               UAV Flight Control
-
-Ground station telemetry is handled separately through the LoRa telemetry link.
+```sh
+python3 -m unittest discover -s tests -v
+python3 main.py --simulate --message SOS --unit 0.1
 ```
 
----
+SOS and 0.1 seconds are simulation examples, not confirmed transmitter settings.
+The simulator never opens a camera or MAVLink device. It prints the decoded
+message and acceptance result, followed by a blocked RTL dry-run decision when
+vehicle status is absent. Events are appended to `ir_events.log`.
 
-## Vision & Landing Pipeline
+For camera use, install Picamera2 and OpenCV/NumPy from the package source that
+supports your Pi's Debian 13 camera stack. Where those packages are available:
 
-The current implementation follows this sequence:
-
-1. Capture a frame from the Raspberry Pi camera.
-2. Detect ArUco markers from the `DICT_4X4_50` dictionary.
-3. Use the calibrated camera matrix and distortion coefficients.
-4. Estimate the marker pose using `cv2.solvePnP(..., SOLVEPNP_IPPE_SQUARE)`.
-5. Reproject the marker corners and derive a confidence value from the reprojection error.
-6. Compute the normalized horizontal and vertical target offsets.
-7. Combine vision information with flight-controller altitude telemetry.
-8. Send updated MAVLink landing-target information to the flight controller.
-9. Log state, altitude, estimated distance, position error, and confidence to CSV.
-
-### Control thresholds used by the current code
-
-| Parameter | Value | Purpose |
-|---|---:|---|
-| Confidence threshold | 90% | Minimum accepted detection confidence |
-| Precision-approach altitude | 300 cm | Enables the precision-approach state |
-| Final landing altitude | 30 cm | Enables final LAND transition when centered |
-| Centering threshold | 0.10 normalized error | Defines acceptable X/Y target centering |
-| Marker-loss fail-safe | 1.0 s | Returns the system to search/LOITER behavior |
-
----
-
-## Camera Calibration
-
-Accurate pose estimation requires a calibrated camera. The repository includes two scripts for this process:
-
-- `capture_images.py` – captures checkerboard images from the Raspberry Pi camera.
-- `camera_calibration.py` – detects checkerboard corners and calculates the camera matrix and distortion coefficients.
-
-The calibration script generates:
-
-```text
-calib_data.npz
+```sh
+sudo apt install python3-picamera2 python3-opencv python3-numpy
+python3 -c "from picamera2 import Picamera2; print(Picamera2.global_camera_info())"
 ```
 
-This file contains the intrinsic camera matrix and distortion coefficients and is required by `main.py` before the landing program can run.
+Package availability on this exact Debian image has not been verified. Avoid
+overlaying a working system OpenCV installation with a second pip installation.
+`requirements.txt` lists Python dependencies for environments using pip; Picamera2
+is supplied by the Pi camera stack. MAVLink monitoring additionally needs pymavlink
+and pyserial. Verify imports in the actual Python 3.13 environment before use.
 
----
+## Camera configuration and calibration
 
-## Main Software Components
+Copy `camera_config.template.json` to a local JSON file. Null entries intentionally
+prevent startup until measured values are supplied. The 640x480 size is an example
+and must be checked against the enumerated camera modes. Startup requires exactly
+one OV5647; it does not assume a second camera.
 
-| File | Purpose |
-|---|---|
-| `main.py` | Main vision, pose-estimation, state-machine, HUD, and logging loop |
-| `drone_control.py` | MAVLink communication, telemetry handling, flight-mode commands, and landing-target transmission |
-| `capture_images.py` | Captures checkerboard images for camera calibration |
-| `camera_calibration.py` | Computes and saves camera calibration parameters |
-| `requirements.txt` | Python dependencies |
-| `ArUco_marker.pdf` | Printable landing marker asset |
+Settings specify exposure in microseconds, analogue gain, maximum frame interval
+in seconds, grayscale brightness threshold (0..255), minimum/maximum blob areas in
+pixels, array search radius in pixels, phase-correlation response threshold,
+maximum inter-frame motion in pixels, intensity percentile (0..100), ON/OFF contrast
+against the surrounding background, maximum prediction age in seconds, ON history
+length and relative exposure/gain tolerance.
 
-Runtime-generated files such as `calib_data.npz` and `flight_log.csv` are produced locally during calibration and testing.
+Measure settings using recorded or live ground-test frames: compare beacon ON,
+OFF and ambient-only images, keep exposure below the shortest pulse, avoid
+saturation and measure actual frame intervals. Choose timing such that pulses
+contain multiple frames. Lock exposure/gain and inspect metadata. Test sunlight,
+reflections, movement and partial occlusion. No automatic threshold calibration is
+claimed; diagnostic mode requires an initial measured configuration.
 
----
-
-## Software Stack
-
-- Python 3
-- OpenCV / `opencv-contrib-python`
-- NumPy
-- Picamera2
-- Pymavlink
-- PySerial
-- ArduPilot-compatible CrossFlight flight controller
-
-Python package requirements are listed in `requirements.txt`.
-
----
-
-## Running the System
-
-### 1. Install Python dependencies
-
-```bash
-pip install -r requirements.txt
+```sh
+python3 main.py --message YOURMESSAGE --unit MEASURED_SECONDS --camera-config camera.json
 ```
 
-> On Raspberry Pi OS, `Picamera2` is normally installed through the Raspberry Pi system packages rather than pip.
+The preview shows the feed, aggregate search circle, intensity, state, quality,
+centroid and observation age information in the log. Press q to stop. Camera loss
+logs an UNKNOWN observation and stops acquisition. Exposure instability or a frame
+gap clears tracking and decoder continuity.
 
-### 2. Capture calibration images
+The detector clusters nearby bright components into one beacon, not separate Morse
+targets. It retains bounded ON centroid history. During darkness it uses global
+image phase correlation to shift the search region, only within configured motion
+and age limits. This is a bench prototype: it does not yet reconstruct the full
+20-LED physical geometry, authenticate IR wavelength or guarantee rejection of
+reflections. Its binary quality value indicates threshold eligibility, not a
+calibrated probability. OFF prediction requires textured background and must be
+validated against drone motion. UNKNOWN cannot become an OFF Morse gap.
 
-```bash
-python3 capture_images.py
+## Morse protocol and validation
+
+`Protocol` in `config.py` exposes dot duration, timing tolerance, confirmation count,
+confirmation window, cooldown and minimum quality. `--message` and `--unit` are
+required: no final transmitter message or timing is invented. The initial decoder
+supports uppercase alphanumeric single-word messages. Dot/dash and symbol/letter
+gaps use 1/3 units. The proposed frame delimiter is at least 10 OFF units before
+and after a message; `MorseDecoder(frame_units=...)` makes this adjustable.
+**Confirm framing with transmitter firmware before hardware decoding.** Word gaps
+and multiword messages are intentionally unsupported rather than guessed.
+
+Starting mid-transmission, UNKNOWN observations, bad pulse/gap timings and malformed
+symbols discard the frame. A missing trailing delimiter never completes a message.
+Confirmation expiration restarts the count. At least two messages are required.
+After acceptance, cooldown blocks immediate duplicates and a session latch blocks
+later duplicates even after cooldown. Restarting the application starts a new
+session; no automatic operational rearming is implemented.
+
+## Pixhawk and RTL dry-run
+
+Optional camera-mode arguments:
+
+```sh
+python3 main.py --message YOURMESSAGE --unit MEASURED_SECONDS --camera-config camera.json --mavlink-device /dev/serial/by-id/CONFIRMED_DEVICE --system-id CONFIRMED_ID --component-id CONFIRMED_COMPONENT
 ```
 
-### 3. Calibrate the camera
+Monitoring does not request streams, send heartbeats, write parameters or send
+commands. It accepts messages only from the configured system/component and
+requires fresh telemetry. If HOME_POSITION is not broadcast, it remains missing.
+GPS fix type alone is only a preliminary check, not a complete navigation-health
+assessment. RTL capability and appropriate vehicle state remain unapproved, so
+real monitoring deliberately blocks RTL eligibility until firmware-specific safety
+logic is separately developed and tested. Disconnected/stale telemetry fails closed.
+RTL returns to configured home, not automatically to the IR pad.
 
-```bash
-python3 camera_calibration.py
-```
+## Precision landing and shared blinking geometry
 
-Verify that `calib_data.npz` was created successfully.
+ON-frame centroid history is diagnostic. OFF estimates are predictions, not new
+measurements. Calibration must match resolution/crop; lens distortion, camera to
+body rotation/translation, attitude, timestamp alignment, valid range and ground
+geometry are required before metric position can be prepared. Pixhawk relative
+altitude alone is not necessarily distance to the pad.
 
-### 4. Run the autonomous landing software
+Evaluate dedicated sustained-ON landing windows or a separate landing transmission
+phase. Long OFF Morse gaps can exceed usable target-estimate freshness. No landing
+window schedule is assumed. Landing validity remains false throughout this version.
 
-```bash
-python3 main.py
-```
+Future integration must follow the supported LANDING_TARGET coordinate frame,
+distance and position-validity requirements:
+https://mavlink.io/en/services/landing_target.html
+https://ardupilot.org/dev/docs/mavlink-precision-landing.html
 
-The program opens the real-time HUD, connects to the flight controller, processes the camera feed, sends landing-target information, and records a flight log.
+## Verification and remaining hardware work
 
----
+Protocol tests cover valid/repeated messages, incomplete frames, noise, wrong pulse
+and character timing, low quality, receiver loss, confirmation timeout, cooldown,
+duplicates, timestamp ordering and stale/invalid Pixhawk status. Camera tests use
+fakes where hardware is unavailable; real image-processing validation remains open.
+Development tests run on Windows Python 3.10, not the target Pi/Python 3.13 stack.
 
-## Fail-Safe Behavior
-
-The system includes several software safeguards:
-
-- landing logic depends on valid and recent telemetry
-- detections below the confidence threshold are rejected
-- loss of the visual target for more than the configured timeout returns the system to `SEARCHING`
-- the flight controller is commanded to `LOITER` when the target is lost
-- invalid landing-target data is explicitly transmitted during the fail-safe state
-- resources are released cleanly when the program exits
-
-These mechanisms are intended to prevent stale vision or telemetry data from being treated as valid landing information.
-
----
-
-## Hardware Platform
-
-The prototype combines:
-
-- F450 quadcopter frame
-- RadioLink CrossFlight flight controller
-- Raspberry Pi 4 companion computer
-- Raspberry Pi camera
-- brushless motors and ESCs
-- LiPo battery power system
-- dedicated 5 V regulator for the Raspberry Pi
-- LoRa telemetry link for communication with the ground station
-
-The onboard Raspberry Pi communicates directly with the flight controller over UART for the autonomous landing logic; the LoRa link is used separately for ground-station telemetry.
-
----
-
-## Validation & Current Limitations
-
-The project demonstrated the complete autonomous landing pipeline in real flight, including visual target detection, pose estimation, MAVLink communication, state transitions, and autonomous touchdown.
-
-Current limitations include:
-
-- dependence on visual detection quality and lighting conditions
-- sensitivity to wind and vehicle motion during the final approach
-- monocular vision distance estimation depends on accurate camera calibration and known marker size
-- no formal statistical landing-accuracy campaign was completed
-- further tuning and additional repeated flight tests would improve robustness and repeatability
-
----
-
-## Repository Media
-
-```text
-media/
-├── uav_platform.png
-├── landing_gui.png
-└── autonomous_landing_demo.mp4
-```
-
-The image and video files above are referenced directly from this README.
-
----
-
-## Academic Project
-
-Final-year project in Electrical Engineering at **Afeka – Tel Aviv Academic College of Engineering**.
-
-Project supervisor: **Ehud Dayan**
-
----
-
-## License
-
-See the repository `LICENSE` file for licensing information.
+Still required: camera filter/lens and mounting details; LED wavelength, physical
+coordinates and driver/controller circuit; confirmed Morse framing/timing/message;
+actual camera enumeration and recordings; firmware/vehicle identity; telemetry
+availability; range/ground geometry; measured thresholds and controlled ground tests.
+Wiring is intentionally unspecified until LED power/driver hardware is confirmed.

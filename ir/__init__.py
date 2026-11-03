@@ -1,0 +1,1 @@
+"""Shared-array optical processing."""

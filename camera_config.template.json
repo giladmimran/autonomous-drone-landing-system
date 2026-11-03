@@ -1,0 +1,18 @@
+{
+  "size": [640, 480],
+  "exposure_us": null,
+  "gain": null,
+  "max_frame_gap": null,
+  "brightness_threshold": null,
+  "min_blob_area": null,
+  "max_blob_area": null,
+  "array_radius_pixels": null,
+  "motion_response": null,
+  "max_motion_pixels": null,
+  "intensity_percentile": null,
+  "on_contrast": null,
+  "off_contrast": null,
+  "max_off_seconds": null,
+  "history_size": null,
+  "exposure_tolerance": null
+}
