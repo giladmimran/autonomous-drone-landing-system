@@ -5,3 +5,7 @@ numpy>=1.22.0
 # MAVLink & Serial Communication Layer
 pymavlink>=2.4.40
 pyserial>=3.5
+
+# Unified GCS web interface
+fastapi>=0.115,<1
+uvicorn>=0.30,<1

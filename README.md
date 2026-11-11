@@ -165,3 +165,37 @@ coordinates and driver/controller circuit; confirmed Morse framing/timing/messag
 actual camera enumeration and recordings; firmware/vehicle identity; telemetry
 availability; range/ground geometry; measured thresholds and controlled ground tests.
 Wiring is intentionally unspecified until LED power/driver hardware is confirmed.
+
+## Unified GCS: human detection and IR view
+
+Install the dependencies in your Python environment, then run from the repository root:
+
+```sh
+python3 -m pip install -r requirements.txt
+python3 -m uvicorn launcher:app --app-dir drone-gcs --host 0.0.0.0 --port 8000
+```
+
+Open `http://localhost:8000` (or your Pi's IP on port 8000), then select
+**Human & IR Landing**. The vision session stays alive when switching GCS sections;
+telemetry still uses the launcher's single active serial module. Ports 8000 and
+8001 must be reachable for the existing telemetry views.
+
+Start with **IR simulation** to inspect Morse pulses and repeated confirmations.
+Simulation does not produce people or camera frames. For live capture select
+**OV5647 shared camera**, enter the measured transmitter message, dot duration,
+and the absolute path of your completed camera JSON on the server. Stop
+`capture_images.py` and other camera programs first. Picamera2 is required on the Pi.
+The dashboard's telemetry device is still configured by `PORT` in `drone-gcs/main.py`.
+
+`vision_service.py` passes the same captured frames through OpenCV's built-in HOG
+person detector and the existing IR pipeline. The UI shows person boxes, beacon
+centroid, decoded message, confirmation count, capture errors and freshness.
+HOG is an experimental upright-person detector and is not validated for aerial
+views or an IR-filtered camera. No detections do not establish a clear landing
+area. The external `human_detection_gps.py` system is not bundled or connected.
+
+This integration displays landing readiness only. Actual RTL, descent, target
+transmission and touchdown remain unimplemented; the existing landing geometry
+must be calibrated and validated before a flight-control path can be developed.
+A confirmed Morse message does not command the aircraft. Stopped or stale sessions
+show unknown people/IR status and cannot retain a current beacon confirmation.

@@ -3,6 +3,7 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
+from vision_api import router as vision_router, service as vision_service
 import urllib.request, json
 
 BASE = Path(__file__).resolve().parent
@@ -63,10 +64,12 @@ def start_child(name):
 async def lifespan(app):
     start_child('dashboard')
     yield
+    vision_service.stop()
     with lock:
         stop_child()
 
 app = FastAPI(title='Roberon Unified Drone GCS', lifespan=lifespan)
+app.include_router(vision_router)
 
 @app.get('/', response_class=HTMLResponse)
 def home():
@@ -117,13 +120,15 @@ HTML = r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport
 <span class="pill">Mode <b id="mode">--</b></span><span class="pill">Armed <b id="armed">--</b></span><span class="pill">Firmware <b id="fw">--</b></span><span class="pill">Battery <b id="bat">--</b></span><span class="pill">GPS <b id="gps">--</b></span><span class="pill">Section <b id="section">Dashboard</b></span>
 </div></header>
 <nav class="nav">
-<button data-name="dashboard" class="active">Dashboard</button><button data-name="calibration">Accelerometer / Compass</button><button data-name="radio">Radio Calibration</button><button data-name="parameters">Parameters & Safety</button><button data-name="firmware">Firmware</button><button data-name="frame">Frame Setup</button>
+<button data-name="dashboard" class="active">Dashboard</button><button data-name="vision">Human & IR Landing</button><button data-name="calibration">Accelerometer / Compass</button><button data-name="radio">Radio Calibration</button><button data-name="parameters">Parameters & Safety</button><button data-name="firmware">Firmware</button><button data-name="frame">Frame Setup</button>
 </nav><div class="hint" id="hint">Only one Pixhawk-connected service is active at a time. Switch sections using the navigation above.</div>
-<iframe id="view" title="Drone GCS section" src="http://192.168.0.2:8001/"></iframe>
+<iframe id="view" title="Drone GCS section"></iframe>
 <script>
 const frame=document.getElementById('view');let current='dashboard';
-async function openSection(name){document.querySelectorAll('.nav button').forEach(b=>b.classList.toggle('active',b.dataset.name===name));document.getElementById('hint').textContent='Switching to '+name+'…';try{let r=await fetch('/api/open/'+name,{method:'POST'});let d=await r.json();if(!r.ok)throw Error(d.detail||'Could not open section');current=name;document.getElementById('section').textContent=name;frame.src=d.url;document.getElementById('hint').textContent='Active module: '+name+'. The previous module has been stopped to prevent competing MAVLink readers.';}catch(e){document.getElementById('hint').textContent=e.message;}}
-document.querySelectorAll('.nav button').forEach(b=>b.addEventListener('click',()=>openSection(b.dataset.name)));
+frame.src=location.protocol+'//'+location.hostname+':8001/';
+document.querySelector('[data-name="vision"]').addEventListener('click',()=>{frame.src='/vision';document.getElementById('section').textContent='Human & IR Landing';document.getElementById('hint').textContent='Vision diagnostics run alongside the active telemetry module. Flight commands disabled.';document.querySelectorAll('.nav button').forEach(b=>b.classList.toggle('active',b.dataset.name==='vision'));});
+async function openSection(name){document.querySelectorAll('.nav button').forEach(b=>b.classList.toggle('active',b.dataset.name===name));document.getElementById('hint').textContent='Switching to '+name+'â€¦';try{let r=await fetch('/api/open/'+name,{method:'POST'});let d=await r.json();if(!r.ok)throw Error(d.detail||'Could not open section');current=name;document.getElementById('section').textContent=name;frame.src=location.protocol+'//'+location.hostname+':8001'+d.path;document.getElementById('hint').textContent='Active module: '+name+'. The previous module has been stopped to prevent competing MAVLink readers.';}catch(e){document.getElementById('hint').textContent=e.message;}}
+document.querySelectorAll('.nav button:not([data-name="vision"])').forEach(b=>b.addEventListener('click',()=>openSection(b.dataset.name)));
 async function refresh(){try{let d=await(await fetch('/api/active',{cache:'no-store'})).json();let connected=!!d.connected;let c=document.getElementById('conn');c.textContent=connected?'PIXHAWK CONNECTED':(current==='firmware'?'FIRMWARE MODE':'PIXHAWK DISCONNECTED');c.className=connected?'ok':'bad';document.getElementById('mode').textContent=d.mode||'--';document.getElementById('armed').textContent=d.armed?'ARMED':'DISARMED';document.getElementById('armed').className=d.armed?'bad':'ok';document.getElementById('fw').textContent=d.firmware||'--';document.getElementById('bat').textContent=d.battery==null?'N/A':d.battery+' V';document.getElementById('gps').textContent=d.gps_fix==null?'N/A':('Fix '+d.gps_fix+' / '+(d.satellites??0)+' sats');}catch(e){document.getElementById('conn').textContent='STATUS UNAVAILABLE'}}
 setInterval(refresh,1000);refresh();
 </script></body></html>'''

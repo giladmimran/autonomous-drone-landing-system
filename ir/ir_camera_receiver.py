@@ -8,7 +8,7 @@ REQUIRED = ('size', 'exposure_us', 'gain', 'max_frame_gap', 'brightness_threshol
             'max_motion_pixels', 'intensity_percentile', 'on_contrast', 'off_contrast',
             'max_off_seconds', 'history_size', 'exposure_tolerance')
 
-def receive(settings):
+def receive(settings, *, on_frame=None, stop_event=None, preview=True):
     import cv2
     from picamera2 import Picamera2
     missing = set(REQUIRED) - settings.keys()
@@ -39,7 +39,7 @@ def receive(settings):
         camera.start()
         started = True
         detector, previous = IRDetector(settings), None
-        while True:
+        while stop_event is None or not stop_event.is_set():
             request = camera.capture_request()
             try:
                 frame, metadata = request.make_array('main'), request.get_metadata()
@@ -59,6 +59,11 @@ def receive(settings):
                 observation = detector.process(frame, now)
             previous = now
             logging.info('Camera observation: %r metadata: %r', observation, metadata)
+            if on_frame is not None:
+                on_frame(frame, observation)
+            if not preview:
+                yield now, observation['state'], observation['quality']
+                continue
             display = frame.copy()
             if observation['centroid']:
                 center = tuple(int(v) for v in observation['centroid'])
@@ -76,4 +81,5 @@ def receive(settings):
         if started:
             camera.stop()
         camera.close()
-        cv2.destroyAllWindows()
+        if preview:
+            cv2.destroyAllWindows()
