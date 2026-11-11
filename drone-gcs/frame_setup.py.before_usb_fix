@@ -1,0 +1,99 @@
+import threading, time
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+from pymavlink import mavutil
+
+PORT='/dev/ttyACM0'; BAUD=115200
+app=FastAPI(title='Frame Setup')
+master=None
+state={'connected':False,'armed':False,'error':'Connecting to Pixhawk'}
+values={}; condition=threading.Condition(); tx_lock=threading.Lock()
+
+def norm(v):
+    return v.decode('ascii','ignore').rstrip('\x00') if isinstance(v,(bytes,bytearray)) else str(v).rstrip('\x00')
+
+def reader():
+    global master
+    while True:
+        try:
+            if master is None:
+                state.update(connected=False,error='Connecting to Pixhawk')
+                master=mavutil.mavlink_connection(PORT,baud=BAUD)
+                master.wait_heartbeat(timeout=15)
+                state.update(connected=True,error='')
+            msg=master.recv_match(type=['HEARTBEAT','PARAM_VALUE'],blocking=True,timeout=2)
+            if msg is None: continue
+            if msg.get_type()=='HEARTBEAT':
+                state['armed']=bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+            elif msg.get_type()=='PARAM_VALUE':
+                with condition:
+                    values[norm(msg.param_id)]=float(msg.param_value)
+                    condition.notify_all()
+        except Exception as e:
+            state.update(connected=False,error=str(e)); master=None; time.sleep(2)
+threading.Thread(target=reader,daemon=True).start()
+
+def read_param(name,timeout=4):
+    if not master or not state['connected']: raise HTTPException(503,'Pixhawk is not connected')
+    with condition:
+        values.pop(name,None)
+        with tx_lock: master.mav.param_request_read_send(master.target_system,master.target_component,name.encode(),-1)
+        end=time.time()+timeout
+        while time.time()<end:
+            if name in values:return values[name]
+            condition.wait(end-time.time())
+    raise HTTPException(504,f'No PARAM_VALUE response for {name}')
+
+def write_param(name,value,timeout=5):
+    if not master or not state['connected']: raise HTTPException(503,'Pixhawk is not connected')
+    with condition:
+        values.pop(name,None)
+        with tx_lock: master.mav.param_set_send(master.target_system,master.target_component,name.encode(),float(value),mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+        end=time.time()+timeout
+        while time.time()<end:
+            if name in values:
+                actual=values[name]
+                if abs(actual-float(value))<0.01:return actual
+                values.pop(name,None)
+            condition.wait(end-time.time())
+    raise HTTPException(504,f'No matching parameter acknowledgement for {name}')
+
+@app.get('/api/status')
+def status(): return {**state,'frame_class':values.get('FRAME_CLASS'),'frame_type':values.get('FRAME_TYPE')}
+
+@app.get('/api/frame')
+def get_frame():
+    return {'connected':state['connected'],'armed':state['armed'],'FRAME_CLASS':read_param('FRAME_CLASS'),'FRAME_TYPE':read_param('FRAME_TYPE')}
+
+@app.post('/api/frame/save')
+def save_frame(data:dict):
+    if state['armed']: raise HTTPException(409,'Disarm the aircraft before changing frame configuration')
+    try: fc=int(data['frame_class']); ft=int(data['frame_type'])
+    except Exception: raise HTTPException(400,'Invalid frame selection')
+    # ArduCopter FRAME_CLASS: 0 undefined, 1 quad, 2 hexa, 3 octa, 4 octa-quad, 5 Y6, 6 helicopter, 7 tri, 8 singlecopter, 9 coaxcopter, 10-12 dodeca variants, 13 heli-dual, 14 tailsitter, 15 custom.
+    if fc not in range(0,16): raise HTTPException(400,'Unsupported FRAME_CLASS value')
+    if ft not in range(0,4): raise HTTPException(400,'Unsupported FRAME_TYPE value')
+    a=write_param('FRAME_CLASS',fc); b=write_param('FRAME_TYPE',ft)
+    # Verify with fresh PARAM_REQUEST_READ transactions.
+    va=read_param('FRAME_CLASS'); vb=read_param('FRAME_TYPE')
+    return {'success':True,'acknowledged':True,'verified':abs(va-fc)<0.01 and abs(vb-ft)<0.01,'FRAME_CLASS':va,'FRAME_TYPE':vb,'reboot_required':True,'message':'Both parameters acknowledged and read back. Reboot the flight controller for the frame change to take effect.'}
+
+HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Frame Setup</title><style>
+*{box-sizing:border-box}body{margin:0;padding:24px;background:#0b1220;color:#e8eef8;font:15px system-ui,Arial}.wrap{max-width:900px;margin:auto}.card{background:#121e30;border:1px solid #2c405b;border-radius:14px;padding:22px;margin:14px 0}h1{margin:0 0 6px}p,.muted{color:#9fb0c6}.row{display:grid;grid-template-columns:1fr 1fr;gap:16px}label{display:block;color:#b9c9dc;margin:10px 0 7px}select{width:100%;padding:13px;border-radius:8px;background:#0b1627;color:white;border:1px solid #405875;font-size:15px}button{padding:13px 20px;background:#2876c9;color:white;border:0;border-radius:9px;font-weight:700;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}.status{padding:12px;border-radius:8px;background:#1b2b40;margin:12px 0}.warn{color:#ffd27a}.good{color:#4ce0a5}.diagram{font-family:monospace;white-space:pre;line-height:1.5;background:#0a1423;padding:16px;border-radius:9px;overflow:auto}@media(max-width:650px){.row{grid-template-columns:1fr}body{padding:12px}}
+</style></head><body><div class="wrap"><h1>Frame Setup</h1><p>Configure ArduCopter frame class and geometry. Changes are written to the flight controller and read back for verification.</p><div class="status" id="connection">Checking Pixhawk connection…</div><div class="card"><h2>1. Frame Class</h2><div class="row"><div><label for="fc">Frame class</label><select id="fc"><option value="1">Quadrotor</option><option value="2">Hexacopter</option><option value="3">Octocopter</option><option value="4">Octa-Quad</option><option value="5">Y6</option><option value="6">Traditional Helicopter</option><option value="7">Tricopter</option><option value="8">Singlecopter</option><option value="9">CoaxCopter</option><option value="10">Dodeca-hexa</option><option value="11">Dodeca-octa</option><option value="12">Dodeca-octa-quad</option><option value="13">Heli-Dual</option><option value="14">Tailsitter</option><option value="15">Custom</option></select></div><div><label for="ft">Frame type / geometry</label><select id="ft"><option value="0">Plus (+)</option><option value="1">X</option><option value="2">V</option><option value="3">H</option></select></div></div><p class="muted">Frame type availability and meaning depend on the selected frame class and firmware. Confirm against your airframe and motor-output mapping.</p></div><div class="card"><h2>2. Motor layout reference</h2><div class="diagram" id="diagram">        FRONT
+          ↑
+      Motor 1
+          |
+ Motor 4  +  Motor 2
+          |
+      Motor 3
+
+Illustrative only — not a motor-output or rotation-direction test.</div><p class="warn">This diagram is illustrative. Do not use it to wire motors or infer rotation direction. Verify the motor order with the ArduPilot motor test procedure, with propellers removed.</p></div><div class="card"><h2>3. Save configuration</h2><p class="warn">Aircraft must be DISARMED. A reboot is required after changing frame parameters.</p><button id="save" onclick="saveFrame()">SAVE FRAME CONFIGURATION</button><div class="status" id="result">Load current settings before saving.</div></div></div><script>
+const fc=document.getElementById('fc'),ft=document.getElementById('ft'),save=document.getElementById('save'),result=document.getElementById('result');
+async function load(){try{let r=await fetch('/api/frame');let d=await r.json();if(!r.ok)throw Error(d.detail||'Pixhawk unavailable');fc.value=d.FRAME_CLASS;ft.value=d.FRAME_TYPE;document.getElementById('connection').innerHTML='PIXHAWK CONNECTED · '+(d.armed?'ARMED':'DISARMED');save.disabled=!!d.armed;result.textContent='Current values loaded: FRAME_CLASS='+d.FRAME_CLASS+', FRAME_TYPE='+d.FRAME_TYPE;}catch(e){document.getElementById('connection').textContent='PIXHAWK DISCONNECTED';result.textContent=e.message;save.disabled=true;}}
+async function saveFrame(){if(!confirm('Write FRAME_CLASS and FRAME_TYPE to Pixhawk? The flight controller will require a reboot.'))return;save.disabled=true;result.textContent='Writing parameters and waiting for Pixhawk acknowledgements…';try{let r=await fetch('/api/frame/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({frame_class:fc.value,frame_type:ft.value})});let d=await r.json();if(!r.ok)throw Error(d.detail||'Save failed');if(!d.verified)throw Error('Parameter readback did not match requested values');result.innerHTML='<span class="good">PARAMETERS ACKNOWLEDGED AND VERIFIED.</span> FRAME_CLASS='+d.FRAME_CLASS+', FRAME_TYPE='+d.FRAME_TYPE+'. Reboot required.';}catch(e){result.textContent='NOT VERIFIED: '+e.message;}finally{save.disabled=false;}}
+load();
+</script></body></html>'''
+
+@app.get('/',response_class=HTMLResponse)
+def page(): return HTML

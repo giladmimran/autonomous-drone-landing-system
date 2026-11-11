@@ -1,123 +1,220 @@
-from pymavlink import mavutil
+"""Passive Pixhawk diagnostics for indoor hover preparation.
+
+No MAVLink transmissions, parameter writes, arming or mode changes. Run:
+  python3 drone_control.py --device /dev/serial/by-id/CONFIRMED_DEVICE
+AltHold provides altitude hold, not horizontal position hold or hover approval.
+"""
+import argparse
+from collections import deque
+import json
 import threading
 import time
 
+
 class DroneTelemetry:
-    """
-    Handles MAVLink communication in a background thread to prevent lag.
-    Provides methods to retrieve the latest altitude and send landing target data.
-    Usage:
-        drone_control = DroneTelemetry('/dev/ttyAMA0', 57600)
-        drone_control.connect()
-        drone_control.start()
-    """
-    def __init__(self, connection_string='/dev/ttyAMA0', baudrate=921600):
-        self.connection_string = connection_string
-        self.baudrate = baudrate
+    def __init__(self, connection_string, baudrate=115200, *, timeout=10.0,
+                 stale_after=5.0, system_id=None, component_id=1):
+        if timeout <= 0 or stale_after <= 0:
+            raise ValueError('Timeouts must be positive')
+        self.connection_string, self.baudrate = connection_string, baudrate
+        self.timeout, self.stale_after = timeout, stale_after
+        self.system_id, self.component_id = system_id, component_id
         self.master = None
-        self.last_alt = 0.0
-        self.last_alt_update_time = 0.0
+        self.messages = {}
+        self.notices = deque(maxlen=10)
         self.is_running = False
+        self.error = None
         self._thread = None
+        self._lock = threading.RLock()
+        self._stop = threading.Event()
+        self._mavutil = None
+        self.last_alt = 0.0
+        self.last_alt_update_time = None
 
     def connect(self):
-        """
-        Establishes a MAVLink connection to the flight controller and waits for a heartbeat.
-        Also requests the necessary data stream for altitude updates.
-        """
-        self.master = mavutil.mavlink_connection(
-            self.connection_string, baud=self.baudrate, source_system=1, source_component=191)
-        self.master.wait_heartbeat()
-        self.request_data_stream()
+        from pymavlink import mavutil
+        self._mavutil = mavutil
+        try:
+            self.master = mavutil.mavlink_connection(
+                self.connection_string, baud=self.baudrate, autoreconnect=False,
+                source_system=255, source_component=190)
+            deadline = time.monotonic() + self.timeout
+            while time.monotonic() < deadline:
+                self.poll()
+                if self._fresh('HEARTBEAT', time.monotonic()) is not None:
+                    return
+                time.sleep(0.02)
+            raise TimeoutError('No matching ArduPilot autopilot heartbeat before timeout')
+        except Exception as exc:
+            self.error = str(exc)
+            self.stop()
+            raise
 
-    def request_data_stream(self):
-        """
-        Request the drone to send GLOBAL_POSITION_INT messages at 10Hz.
-        This allows us to keep track of the drone's altitude in real-time.
-        We only request the position stream to minimize unnecessary data and reduce latency.
-        """
-        self.master.mav.request_data_stream_send(self.master.target_system, self.master.target_component, mavutil.mavlink.MAV_DATA_STREAM_POSITION, 10, 1)
-        
+    def ingest(self, message, now=None):
+        """Receive-only message handling, also usable with recorded test messages."""
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            kind = message.get_type()
+            if message.get_srcComponent() != self.component_id:
+                return
+            if self.system_id is None:
+                if (kind != 'HEARTBEAT' or message.autopilot != 3 or message.type in (5, 6, 18, 26, 27)):
+                    return
+                self.system_id = message.get_srcSystem()
+            if message.get_srcSystem() != self.system_id:
+                return
+            if kind == 'HEARTBEAT' and message.autopilot != 3:
+                return
+            self.messages[kind] = (now, message)
+            if kind == 'STATUSTEXT':
+                text = message.text
+                if isinstance(text, bytes):
+                    text = text.decode('utf-8', errors='replace')
+                self.notices.append((now, str(text).rstrip('\x00')))
+            elif kind == 'GLOBAL_POSITION_INT':
+                self.last_alt = message.relative_alt / 10.0
+                self.last_alt_update_time = now
+
+    def poll(self):
+        if self.master is None:
+            return
+        for _ in range(200):
+            message = self.master.recv_match(blocking=False)
+            if message is None:
+                break
+            self.ingest(message)
+
+    def _fresh(self, kind, now):
+        entry = self.messages.get(kind)
+        return entry[1] if entry and 0 <= now-entry[0] <= self.stale_after else None
+
+    @staticmethod
+    def _sensor(status, mask):
+        if status is None:
+            return 'UNKNOWN (missing/stale SYS_STATUS)'
+        if status.onboard_control_sensors_present & mask != mask:
+            return 'NOT PRESENT / NOT REPORTED'
+        if status.onboard_control_sensors_enabled & mask != mask:
+            return 'DISABLED / NOT ENABLED'
+        return 'HEALTHY' if status.onboard_control_sensors_health & mask == mask else 'UNHEALTHY'
+
+    def snapshot(self, now=None):
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            heartbeat = self._fresh('HEARTBEAT', now)
+            status = self._fresh('SYS_STATUS', now)
+            gps = self._fresh('GPS_RAW_INT', now)
+            voltage = None
+            if status is not None and status.voltage_battery not in (0, 65535):
+                voltage = status.voltage_battery / 1000.0
+            battery = self._fresh('BATTERY_STATUS', now)
+            if voltage is None and battery is not None:
+                cells = [v for v in battery.voltages if v != 65535]
+                if cells and all(v > 0 for v in cells):
+                    voltage = sum(cells) / 1000.0
+            mode = 'UNKNOWN (missing/stale heartbeat)'
+            modes = []
+            if heartbeat is not None and self._mavutil is not None:
+                mode = self._mavutil.mode_string_v10(heartbeat)
+                if self.master is not None:
+                    modes = sorted((self.master.mode_mapping() or {}).keys())
+            prearm = self._sensor(status, 1 << 28)
+            prearm = {'HEALTHY': 'REPORTED PASS (not authorization to arm)',
+                      'UNHEALTHY': 'REPORTED FAIL'}.get(prearm, 'UNKNOWN: ' + prearm)
+            notices = [text for stamp, text in self.notices if now-stamp <= 30]
+            return {
+                'mavlink_connection': 'OPEN' if self.master is not None and not self.error else 'CLOSED/ERROR',
+                'connection_error': self.error,
+                'heartbeat': 'RECEIVED/FRESH' if heartbeat else 'MISSING/STALE',
+                'vehicle_ids': [self.system_id, self.component_id],
+                'flight_mode': mode,
+                'armed': bool(heartbeat.base_mode & 128) if heartbeat else None,
+                'gps': {'fix_type': gps.fix_type, 'satellites': gps.satellites_visible} if gps else 'UNKNOWN (missing/stale)',
+                'imu': {'gyro': self._sensor(status, 1), 'accelerometer': self._sensor(status, 2)},
+                'barometer': self._sensor(status, 8),
+                'battery_voltage_v': voltage,
+                'battery_note': 'SYS_STATUS or BATTERY_STATUS voltage; null means unavailable, not zero volts',
+                'prearm': prearm,
+                'recent_autopilot_text': notices,
+                'gps_required': 'AltHold itself does not require GPS position; configured arming/EKF/fence requirements UNKNOWN (no parameters requested)',
+                'available_modes_library_mapping': modes,
+                'mode_note': 'Library mapping is not firmware-advertised availability or permission to enter a mode',
+                'althold_assessment': 'NOT FLIGHT APPROVAL: inspect sensor health, estimator, RC, pre-arm messages and setup; no horizontal hold',
+                'control': 'MONITOR ONLY; flight commands disabled',
+            }
+
     def start(self):
-        """
-        Starts the background thread to listen for MAVLink messages.
-        This allows us to continuously update the last known altitude without blocking the main vision processing loop.
-        The thread will run until the program is terminated, ensuring we always have the latest telemetry data.
-        We set the thread as a daemon so it will automatically exit when the main program ends.
-        """
+        if self.master is None:
+            raise RuntimeError('Connect before starting')
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
         self.is_running = True
         self._thread = threading.Thread(target=self._update_loop, daemon=True)
         self._thread.start()
 
-    def stop(self):
-        """
-        Stops the background thread gracefully by setting the is_running flag to False.
-        This allows the thread to exit its loop and terminate cleanly when the program is shutting down.
-        We also join the thread to ensure it has finished before the program exits, preventing any potential issues with dangling threads.
-        """      
-        self.is_running = False
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-    
-    def is_telemetry_valid(self, timeout=2.0):
-        """
-        Returns True if we have received an altitude update within the timeout window.
-        Prevents dangerous landing decisions if the telemetry link hangs.
-        """
-        return (time.time() - self.last_alt_update_time) <= timeout
-
     def _update_loop(self):
-        """
-        Background thread function that continuously listens for MAVLink messages.
-        When a GLOBAL_POSITION_INT message is received, it updates the last known altitude.
-        This allows the main loop to access the latest altitude data without any delay, ensuring timely decision-making for landing.
-        We use a non-blocking receive to ensure the thread can exit gracefully when the program ends.
-        The altitude is stored in centimeters for consistency with the landing target message, which expects altitude in meters (we convert it when sending).
-        """
-        while self.is_running:
-            msg = self.master.recv_match(blocking=False)
-            if msg and msg.get_type() == 'GLOBAL_POSITION_INT':
-                self.last_alt = msg.relative_alt / 10.0     # Convert mm to cm
-                self.last_alt_update_time = time.time()
-            time.sleep(0.01)  # Sleep briefly to prevent high CPU usage
+        try:
+            while not self._stop.is_set():
+                self.poll()
+                self._stop.wait(0.02)
+        except Exception as exc:
+            self.error = str(exc)
+        finally:
+            self.is_running = False
 
-    def set_mode(self, mode_name):
-        """
-        Changes the flight mode of the drone by sending a MAVLink command.
-        The mode_name should be a valid mode recognized by the flight controller (e.g., 'LAND', 'LOITER').
-        If the mode ID is found, we send a MAV_CMD_DO_SET_MODE command to change the drone's mode.
-        This allows us to switch to LAND mode when the target is centered and the altitude is low enough, and switch to LOITER mode if the target is lost.
-        """
-        mode_id = self.master.mode_mapping().get(mode_name)
-        if mode_id is not None:
-            self.master.mav.command_long_send(
-                self.master.target_system, self.master.target_component,
-                mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
-                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, mode_id,
-                0, 0, 0, 0, 0
-            )
-            print(f"Debug: Sent command to change mode to {mode_name}.")
-        else:
-            print(f"Error: Mode '{mode_name}' not found in mode mapping.")
+    def stop(self):
+        self._stop.set()
+        if self._thread and self._thread is not threading.current_thread():
+            self._thread.join(timeout=2)
+        if self.master is not None:
+            self.master.close()
+            self.master = None
+        self.is_running = False
 
-    def send_target(self, n_x, n_y, alt, is_valid=True):
-        """ 
-        Sends a MAVLink message with the landing target information, this function allows us to continuesly update the flight controller
-            with the latest target information, enabling precise landing maneuvers when the target is detected, and providing a clear 
-            indication when the target is lost.
-        The n_x and n_y parameters are the normalized error values for the target's position in the camera frame, 
-            which should be in the range of -1 to 1.
-        The alt parameter is the estimated altitude to the target in centimeters.
-        The is_valid parameter indicates whether the target detection is valid or if we are in a fail-safe state.
-        The valid_flag is set to 1 if the target is valid, and 0 if we are in a fail-safe state. 
-            This allows the flight controller to know whether to trust the landing target data or not.
-        We send a MAVLink message of type LANDING_TARGET, which includes the normalized error values, the altitude, and the validity flag.
-            The message is sent with a coordinate frame of 8 (MAV_FRAME_BODY_NED), which means the error values are relative to the
-            drone's current orientation.
-        The altitude is converted from centimeters to meters by dividing by 100, as the MAVLink message expects altitude in meters.
-        """
-        valid_flag = 1 if is_valid else 0
-        # Send landing target with normalized error and altitude in meters
-        self.master.mav.landing_target_send(
-            0, 0, 8, n_x * 0.52, n_y * 0.52, alt/100.0, 0, 0, 0, 0, 0, [0,0,0,0], 2, valid_flag
-        )
+    def is_telemetry_valid(self, timeout=2.0):
+        return self.last_alt_update_time is not None and time.monotonic()-self.last_alt_update_time <= timeout
+
+    def set_mode(self, *args, **kwargs):
+        raise RuntimeError('Flight-mode commands disabled: monitor-only interface')
+
+    def send_target(self, *args, **kwargs):
+        raise RuntimeError('Landing target transmission disabled: monitor-only interface')
+
+    def request_data_stream(self, *args, **kwargs):
+        raise RuntimeError('Stream requests disabled: passive monitoring only')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--device', required=True, help='Verified USB serial path; no default UART assumption')
+    parser.add_argument('--baud', type=int, default=115200)
+    parser.add_argument('--timeout', type=float, default=10)
+    parser.add_argument('--stale-after', type=float, default=5)
+    parser.add_argument('--interval', type=float, default=1)
+    parser.add_argument('--system-id', type=int)
+    parser.add_argument('--component-id', type=int, default=1)
+    args = parser.parse_args()
+    if args.interval <= 0:
+        parser.error('--interval must be positive')
+    drone = DroneTelemetry(args.device, args.baud, timeout=args.timeout,
+                           stale_after=args.stale_after, system_id=args.system_id,
+                           component_id=args.component_id)
+    try:
+        drone.connect()
+        while True:
+            drone.poll()
+            print(json.dumps(drone.snapshot(), indent=2), flush=True)
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        return 0
+    except Exception as exc:
+        drone.error = str(exc)
+        print(json.dumps(drone.snapshot(), indent=2), flush=True)
+        return 1
+    finally:
+        drone.stop()
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

@@ -1,0 +1,538 @@
+import threading
+import time
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+from pymavlink import mavutil
+
+PORT = "/dev/ttyACM0"
+BAUD = 115200
+
+app = FastAPI()
+lock = threading.RLock()
+send_lock = threading.Lock()
+param_condition = threading.Condition()
+param_values = {}
+
+master = None
+state = {
+    "connected": False,
+    "armed": False,
+    "channels": [0] * 16,
+    "count": 0,
+    "last_update": 0,
+    "error": "Connecting...",
+    "phase": "idle",
+    "minimum": [None] * 16,
+    "maximum": [None] * 16,
+    "trim": [None] * 16,
+    "saved": False,
+    "message": ""
+}
+
+def worker():
+    global master
+    while True:
+        try:
+            if master is None:
+                state["connected"] = False
+                master = mavutil.mavlink_connection(PORT, baud=BAUD)
+                master.wait_heartbeat(timeout=15)
+                state["connected"] = True
+                state["error"] = ""
+                print("Pixhawk heartbeat received")
+
+            msg = master.recv_match(
+                type=["HEARTBEAT", "RC_CHANNELS", "PARAM_VALUE"],
+                blocking=True,
+                timeout=2
+            )
+
+            if msg is None:
+                continue
+
+            if msg.get_type() == "HEARTBEAT":
+                state["armed"] = bool(
+                    msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+                )
+
+            elif msg.get_type() == "PARAM_VALUE":
+                raw_id = msg.param_id
+                name = (
+                    raw_id.decode("ascii", errors="ignore").rstrip("\x00")
+                    if isinstance(raw_id, (bytes, bytearray))
+                    else str(raw_id).rstrip("\x00")
+                )
+                print(
+                    "PARAM_VALUE RECEIVED:",
+                    repr(msg.param_id),
+                    "value=", msg.param_value,
+                    "type=", type(msg.param_id).__name__
+                )
+                with param_condition:
+                    param_values[name] = float(msg.param_value)
+                    param_condition.notify_all()
+
+            elif msg.get_type() == "RC_CHANNELS":
+                values = [
+                    getattr(msg, f"chan{i}_raw", 0)
+                    for i in range(1, 17)
+                ]
+                with lock:
+                    state["channels"] = values
+                    state["count"] = min(6, msg.chancount)
+                    state["last_update"] = time.time()
+
+                    if state["phase"] == "capture":
+                        for i, value in enumerate(values[:state["count"]]):
+                            if 800 <= value <= 2200:
+                                lo = state["minimum"][i]
+                                hi = state["maximum"][i]
+                                state["minimum"][i] = value if lo is None else min(lo, value)
+                                state["maximum"][i] = value if hi is None else max(hi, value)
+
+        except Exception as e:
+            print("MAVLink error:", e)
+            state["connected"] = False
+            state["error"] = str(e)
+            master = None
+            time.sleep(2)
+
+threading.Thread(target=worker, daemon=True).start()
+
+@app.get("/api/radio")
+def status():
+    with lock:
+        return {
+            **state,
+            "signal": time.time() - state["last_update"] < 2
+        }
+
+@app.post("/api/start")
+def start():
+    if not state["connected"]:
+        raise HTTPException(503, "Pixhawk is not connected")
+    if state["armed"]:
+        raise HTTPException(400, "Disarm the vehicle first")
+
+    with lock:
+        state["minimum"] = [None] * 16
+        state["maximum"] = [None] * 16
+        state["trim"] = [None] * 16
+        state["saved"] = False
+        state["message"] = "Move every stick, switch and knob through its full range."
+        state["phase"] = "capture"
+
+    return {"ok": True}
+
+@app.post("/api/finish")
+def finish():
+    with lock:
+        if state["phase"] != "capture":
+            raise HTTPException(400, "Start calibration first")
+
+        count = state["count"]
+        mins = state["minimum"][:count]
+        maxs = state["maximum"][:count]
+
+        for i, (lo, hi) in enumerate(zip(mins, maxs)):
+            if lo is None or hi is None or hi - lo < 100:
+                raise HTTPException(
+                    400,
+                    f"Channel {i+1} has insufficient movement. Move it through its full range."
+                )
+
+        state["phase"] = "trim"
+        state["message"] = "Centre all sticks and switches. Keep throttle fully DOWN, then press Save."
+    return {"ok": True}
+
+
+def set_parameter(name, value):
+    global master
+
+    if master is None or not state["connected"]:
+        return False
+
+    with param_condition:
+        param_values.pop(name, None)
+
+    with send_lock:
+        master.mav.param_set_send(
+            master.target_system,
+            master.target_component,
+            name.encode("ascii"),
+            float(value),
+            mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+        )
+
+    deadline = time.time() + 5
+
+    with param_condition:
+        while time.time() < deadline:
+            if name in param_values:
+                actual = param_values.pop(name)
+                print(f"{name}: requested={value}, received={actual}")
+                return abs(actual - float(value)) < 1.0
+
+            param_condition.wait(timeout=0.25)
+
+    print(f"Timeout waiting for {name}")
+    return False
+
+@app.post("/api/save")
+def save():
+    if not state["connected"]:
+        raise HTTPException(503, "Pixhawk disconnected")
+    if state["armed"]:
+        raise HTTPException(400, "Vehicle must be disarmed")
+
+    with lock:
+        if state["phase"] != "trim":
+            raise HTTPException(400, "Complete endpoint capture first")
+
+        count = state["count"]
+        mins = state["minimum"][:count]
+        maxs = state["maximum"][:count]
+        channels = state["channels"][:count]
+
+        trims = []
+        for i, (lo, hi) in enumerate(zip(mins, maxs)):
+            # ArduCopter default channel mapping: throttle is channel 3.
+            trim = lo if i == 2 else round((lo + hi) / 2)
+            trims.append(trim)
+
+        state["trim"] = trims
+
+    results = []
+    for i, (lo, hi, trim) in enumerate(zip(mins, maxs, trims), start=1):
+        for suffix, value in [
+            ("_MIN", lo),
+            ("_MAX", hi),
+            ("_TRIM", trim)
+        ]:
+            name = f"RC{i}{suffix}"
+            try:
+                ok = set_parameter(name, value)
+            except Exception as e:
+                ok = False
+                print(name, e)
+
+            results.append((name, value, ok))
+            if not ok:
+                raise HTTPException(
+                    502,
+                    f"Could not verify {name}. Calibration may be partially saved. Check Pixhawk connection."
+                )
+
+    with lock:
+        state["phase"] = "done"
+        state["saved"] = True
+        state["message"] = "All captured RC parameters were acknowledged by the Pixhawk."
+
+    print("Radio parameters verified:", results)
+    return {"ok": True, "results": results}
+
+
+def read_parameter(name, timeout=5):
+    global master
+    if master is None or not state["connected"]:
+        raise HTTPException(503, "Pixhawk disconnected")
+
+    with param_condition:
+        param_values.pop(name, None)
+
+    with send_lock:
+        master.mav.param_request_read_send(
+            master.target_system,
+            master.target_component,
+            name.encode("ascii"),
+            -1
+        )
+
+    deadline = time.time() + timeout
+    with param_condition:
+        while time.time() < deadline:
+            if name in param_values:
+                return param_values.pop(name)
+            param_condition.wait(timeout=0.25)
+
+    raise HTTPException(504, f"No response for {name}")
+
+
+@app.get("/api/settings")
+def get_settings():
+    values = {}
+    for name in ["ARMING_SKIPCHK", "BRD_SAFETY_DEFLT", "RC6_OPTION"]:
+        try:
+            values[name] = read_parameter(name)
+        except HTTPException:
+            values[name] = None
+
+    return {
+        "connected": state["connected"],
+        "arm_checks": values["ARMING_SKIPCHK"] == 0,
+        "arm_checks_raw": values["ARMING_SKIPCHK"],
+        "board_safety": values["BRD_SAFETY_DEFLT"] == 1,
+        "rc6_arm": values["RC6_OPTION"] == 153,
+        "raw": values
+    }
+
+
+@app.post("/api/settings/save")
+def save_settings(data: dict):
+    if not state["connected"] or master is None:
+        raise HTTPException(503, "Pixhawk disconnected")
+    if state["armed"]:
+        raise HTTPException(400, "Disarm the vehicle first")
+
+    changes = [
+        ("ARMING_SKIPCHK", 0 if data["arm_checks"] else -1),
+        ("BRD_SAFETY_DEFLT", 1 if data["board_safety"] else 0),
+        ("RC6_OPTION", 153 if data["rc6_arm"] else 0)
+    ]
+
+    results = []
+    for name, value in changes:
+        ok = set_parameter(name, value)
+        results.append({"parameter": name, "value": value, "verified": ok})
+        if not ok:
+            raise HTTPException(502, f"Could not verify {name}. Some settings may have been saved.")
+
+    return {"success": True, "results": results, "reboot_required": True}
+
+
+@app.get("/parameters", response_class=HTMLResponse)
+def parameter_page():
+    return """
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Parameter Settings</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;padding:22px;background:#0b1220;color:#eef2ff;font-family:Arial}
+.wrap{max-width:760px;margin:auto}
+h1{font-size:26px;margin-bottom:5px}
+.sub,.note{color:#9eacc0;font-size:13px;line-height:1.6}
+.card{background:#151f30;border:1px solid #293950;border-radius:15px;padding:20px;margin:17px 0}
+.item{display:flex;align-items:center;justify-content:space-between;gap:15px;padding:17px 0;border-bottom:1px solid #293950}
+.item:last-child{border:0}
+.name{font-weight:bold;font-size:15px}
+.code{font-size:12px;color:#91a2ba;margin-top:5px}
+.switch{position:relative;width:54px;height:30px;flex-shrink:0}
+.switch input{display:none}
+.slider{position:absolute;inset:0;background:#45546a;border-radius:30px;cursor:pointer;transition:.2s}
+.slider:before{content:"";position:absolute;width:22px;height:22px;left:4px;top:4px;background:white;border-radius:50%;transition:.2s}
+input:checked+.slider{background:#269c70}
+input:checked+.slider:before{transform:translateX(24px)}
+button{width:100%;padding:16px;border:0;border-radius:11px;background:#3d8cff;color:white;font-weight:bold;font-size:15px;margin-top:12px}
+.warning{color:#ffce8c}
+.success{color:#8ee8b4}
+.error{color:#ff9999}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>Parameter Settings</h1>
+<div class="sub">Pixhawk 6C · ArduCopter configuration</div>
+<div class="card">
+<div id="status" class="note">Reading current Pixhawk parameters...</div>
+
+<div class="item">
+<div><div class="name">Arm Checks</div><div class="code">ARMING_SKIPCHK</div></div>
+<label class="switch"><input id="arm" type="checkbox"><span class="slider"></span></label>
+</div>
+<div class="note warning">OFF skips all non-mandatory arming checks. Not recommended for flight.</div>
+
+<div class="item">
+<div><div class="name">Board Safety Default</div><div class="code">BRD_SAFETY_DEFLT</div></div>
+<label class="switch"><input id="safety" type="checkbox"><span class="slider"></span></label>
+</div>
+<div class="note">ON requires the physical safety switch to release motor outputs.</div>
+
+<div class="item">
+<div><div class="name">RC6 Arm / Disarm</div><div class="code">RC6_OPTION · 153 = Arm / Disarm</div></div>
+<label class="switch"><input id="rc6" type="checkbox"><span class="slider"></span></label>
+</div>
+<div class="note warning">A disarm switch can stop motors immediately. Use a deliberate, protected switch.</div>
+
+<button id="save" onclick="save()">SAVE TO PIXHAWK</button>
+<div id="message" class="note"></div>
+</div>
+</div>
+<script>
+async function load(){
+ try{
+  const r=await fetch("/api/settings"),d=await r.json();
+  if(!r.ok)throw new Error(d.detail||"Could not read parameters");
+  if(d.raw.ARMING_SKIPCHK===null||d.raw.BRD_SAFETY_DEFLT===null||d.raw.RC6_OPTION===null)
+   throw new Error("Could not read all three parameters. Check Pixhawk connection.");
+  document.getElementById("arm").checked=d.arm_checks;
+  let warning = d.arm_checks_raw!==0 ? "Arming checks have a custom skip value: "+d.arm_checks_raw+". Review before saving." : "";
+  document.getElementById("safety").checked=d.board_safety;
+  document.getElementById("rc6").checked=d.rc6_arm;
+  document.getElementById("status").textContent=warning || "Current values loaded from Pixhawk.";
+ }catch(e){
+  document.getElementById("status").textContent=e.message;
+  document.getElementById("save").disabled=true;
+ }
+}
+async function save(){
+ const b=document.getElementById("save"),m=document.getElementById("message");
+ b.disabled=true;b.textContent="SAVING...";
+ try{
+  const r=await fetch("/api/settings/save",{
+   method:"POST",headers:{"Content-Type":"application/json"},
+   body:JSON.stringify({
+    arm_checks:document.getElementById("arm").checked,
+    board_safety:document.getElementById("safety").checked,
+    rc6_arm:document.getElementById("rc6").checked
+   })
+  });
+  const d=await r.json();
+  if(!r.ok)throw new Error(d.detail||"Save failed");
+  m.className="success";
+  m.textContent="All three parameters saved and verified. Reboot Pixhawk if required.";
+  b.textContent="SAVED SUCCESSFULLY";
+ }catch(e){
+  m.className="error";m.textContent=e.message;
+  b.disabled=false;b.textContent="RETRY SAVE";
+ }
+}
+load();
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def page():
+    return """
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Radio Calibration</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#0b1220;color:#eef2ff;font-family:Arial;padding:20px}
+.wrap{max-width:850px;margin:auto}
+h1{font-size:25px;margin:0 0 7px}
+.sub,.note{color:#9eacc0;font-size:13px;line-height:1.6}
+.card{background:#151f30;border:1px solid #293950;border-radius:15px;padding:18px;margin:15px 0}
+.row{display:flex;justify-content:space-between;gap:10px;align-items:center}
+.badge{font-size:12px;padding:7px 11px;border-radius:20px;background:#633b20;color:#ffcf9e}
+.badge.ok{background:#174b37;color:#9bf0c3}
+.channel{margin:18px 0}
+.labels{display:flex;justify-content:space-between;font-size:13px;margin-bottom:7px}
+.track{height:19px;background:#293950;border-radius:5px;overflow:hidden;position:relative}
+.fill{height:100%;background:#ed4545;width:0%;transition:width .08s;box-shadow:0 0 8px #ed454577}
+.values{font-size:11px;color:#9eacc0;margin-top:5px}
+button{width:100%;padding:16px;border:0;border-radius:11px;font-weight:bold;font-size:15px;background:#3d8cff;color:white;margin-top:12px}
+button:disabled{opacity:.35}
+.secondary{background:#293950}
+.success{color:#8ee8b4}
+.error{color:#ff9b9b}
+#message{margin-top:10px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>Radio Calibration</h1>
+<div class="sub">Receiver endpoint calibration · Pixhawk 6C</div>
+
+<div class="card row">
+<div>
+<b>Pixhawk status</b>
+<div class="note" id="info">Connecting...</div>
+</div>
+<div class="badge" id="badge">CONNECTING</div>
+</div>
+
+<div class="card">
+<div class="row"><b id="step">Step 1 · Ready</b><span class="note" id="count"></span></div>
+<p class="note" id="instruction">Keep the vehicle disarmed and propellers removed. Start when ready.</p>
+<div id="channels"></div>
+<div id="message" class="note"></div>
+<button id="start" onclick="start()">START CALIBRATION</button>
+<button id="finish" class="secondary" onclick="finish()" style="display:none">DONE MOVING CONTROLS</button>
+<button id="save" onclick="save()" style="display:none">SAVE TO PIXHAWK</button>
+</div>
+</div>
+<script>
+const names=["Roll","Pitch","Throttle","Yaw","Aux 1","Aux 2"];
+const root=document.getElementById("channels");
+names.forEach((n,i)=>{
+ root.innerHTML+=`<div class="channel">
+ <div class="labels"><span>CH ${i+1} · ${n}</span><b id="v${i}">---</b></div>
+ <div class="track"><div style="position:absolute;left:50%;top:0;height:100%;width:2px;background:#dce3ee66;z-index:2"></div><div class="fill" id="b${i}"></div></div>
+ <div class="values" id="e${i}">MIN: — &nbsp; MAX: —</div>
+ </div>`;
+});
+async function post(url){
+ const r=await fetch(url,{method:"POST"});
+ const d=await r.json();
+ if(!r.ok)throw new Error(d.detail||"Request failed");
+ return d;
+}
+function message(t,err=false){
+ const el=document.getElementById("message");
+ el.textContent=t;el.className=err?"error":"note";
+}
+async function start(){
+ try{
+  await post("/api/start");
+  document.getElementById("start").style.display="none";
+  document.getElementById("finish").style.display="block";
+  document.getElementById("step").textContent="Step 2 · Move controls";
+  document.getElementById("instruction").textContent="Move all four sticks through their full travel. Operate AUX switches and knobs through every position. Only CH1–CH6 are calibrated.";
+  message("Capturing minimum and maximum values...");
+ }catch(e){message(e.message,true)}
+}
+async function finish(){
+ try{
+  await post("/api/finish");
+  document.getElementById("finish").style.display="none";
+  document.getElementById("save").style.display="block";
+  document.getElementById("step").textContent="Step 3 · Centre controls";
+  document.getElementById("instruction").textContent="Centre all sticks and switches. Keep throttle fully DOWN. Then save.";
+  message("Endpoints captured. Check the values before saving.");
+ }catch(e){message(e.message,true)}
+}
+async function save(){
+ const b=document.getElementById("save");
+ b.disabled=true;b.textContent="SAVING...";
+ try{
+  await post("/api/save");
+  document.getElementById("step").textContent="Calibration complete";
+  document.getElementById("instruction").textContent="Pixhawk acknowledged the saved RC parameters.";
+  message("Radio calibration saved and verified.",false);
+  document.getElementById("message").className="success";
+  b.textContent="SAVED SUCCESSFULLY";
+ }catch(e){
+  message(e.message,true);b.disabled=false;b.textContent="RETRY SAVE";
+ }
+}
+async function update(){
+ try{
+  const r=await fetch("/api/radio"),d=await r.json();
+  document.getElementById("badge").textContent=d.signal?"RECEIVER ACTIVE":"NO RC SIGNAL";
+  document.getElementById("badge").className="badge"+(d.signal?" ok":"");
+  document.getElementById("info").textContent=d.error|| (d.armed?"ARMED — calibration blocked":"DISARMED");
+  document.getElementById("count").textContent=d.count+" channels";
+  d.channels.forEach((v,i)=>{
+   document.getElementById("v"+i).textContent=(v>=800&&v<=2200)?v+" µs":"No data";
+   document.getElementById("b"+i).style.width=(v>=800&&v<=2200)?Math.max(0,Math.min(100,(v-800)/14))+"%":"0%";
+   const lo=d.minimum[i],hi=d.maximum[i];
+   document.getElementById("e"+i).textContent="MIN: "+(lo??"—")+"   MAX: "+(hi??"—");
+  });
+  if(d.phase==="done")document.getElementById("save").disabled=true;
+ }catch(e){}
+}
+setInterval(update,200);update();
+</script>
+</body>
+</html>
+"""
+

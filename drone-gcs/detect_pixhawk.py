@@ -1,0 +1,37 @@
+from pymavlink import mavutil
+import time
+
+ports = [
+    '/dev/serial/by-id/usb-Holybro_Pixhawk6C_2E0042001651333337363133-if00',
+    "/dev/ttyACM1"
+]
+
+for port in ports:
+    print(f"\nTesting {port}")
+
+    try:
+        master = mavutil.mavlink_connection(
+            port,
+            baud=115200,
+            source_system=255
+        )
+
+        print("Waiting for MAVLink heartbeat...")
+
+        heartbeat = master.wait_heartbeat(timeout=10)
+
+        if heartbeat:
+            print("\nCONNECTED!")
+            print("Port:", port)
+            print("System ID:", master.target_system)
+            print("Component ID:", master.target_component)
+            print("Vehicle Type:", heartbeat.type)
+            print("Autopilot:", heartbeat.autopilot)
+
+        else:
+            print("No heartbeat received.")
+
+        master.close()
+
+    except Exception as e:
+        print("Error:", e)
