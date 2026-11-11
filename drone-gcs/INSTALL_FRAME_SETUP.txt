@@ -1,0 +1,12 @@
+Frame Setup module installation
+
+1. Stop the unified GCS with Ctrl+C in its running terminal.
+2. Back up launcher.py.
+3. Copy frame_setup.py into ~/drone-gcs/ and replace launcher.py with the supplied patched launcher.py.
+4. Run: source .venv/bin/activate && python -m py_compile frame_setup.py launcher.py
+5. Start: uvicorn launcher:app --host 0.0.0.0 --port 8000
+6. Open http://192.168.0.2:8000 and select Frame Setup.
+
+The Frame Setup module refuses writes while armed. It writes FRAME_CLASS and FRAME_TYPE, waits for PARAM_VALUE acknowledgements, and reads both parameters back. It reports that a reboot is required; it does not automatically reboot the aircraft.
+
+Safety: remove propellers before any motor testing. The motor layout drawing is illustrative only, not a wiring/rotation reference. Confirm frame class/type and motor output mapping against the exact airframe and ArduPilot documentation before saving. No motor test controls are included in this initial module.

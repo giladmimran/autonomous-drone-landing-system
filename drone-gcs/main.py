@@ -1,0 +1,234 @@
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+from pymavlink import mavutil
+from threading import Thread, Lock
+import time
+
+app = FastAPI()
+PORT = '/dev/serial/by-id/usb-Holybro_Pixhawk6C_2E0042001651333337363133-if00'
+lock = Lock()
+last_heartbeat = 0
+
+data = {
+    "connected": False,
+    "mode": "--",
+    "armed": False,
+    "firmware": "--",
+    "roll": 0, "pitch": 0, "yaw": 0,
+    "gyro": [0,0,0],
+    "accel": [0,0,0],
+    "mag": [0,0,0],
+    "heading": 0,
+    "battery": None,
+    "gps_fix": 0,
+    "satellites": 0,
+    "lat": None, "lon": None, "alt": None,
+    "rc": [],
+    "rates": {},
+    "last_update": None
+}
+
+def worker():
+    global last_heartbeat
+
+    while True:
+        master = None
+        try:
+            print("Connecting to Pixhawk...")
+            master = mavutil.mavlink_connection(
+                PORT, baud=115200, source_system=255
+            )
+            master.wait_heartbeat(timeout=15)
+            last_heartbeat = time.time()
+
+            print("Pixhawk connected")
+
+            # Request selected live message rates
+            rates = {
+                "ATTITUDE": 10,
+                "RAW_IMU": 10,
+                "SYS_STATUS": 2,
+                "GPS_RAW_INT": 2,
+                "GLOBAL_POSITION_INT": 5,
+                "RC_CHANNELS": 5,
+                "VFR_HUD": 5,
+                "AUTOPILOT_VERSION": 0.5
+            }
+
+            for name, hz in rates.items():
+                msg_id = getattr(
+                    mavutil.mavlink, "MAVLINK_MSG_ID_" + name
+                )
+                master.mav.command_long_send(
+                    master.target_system,
+                    master.target_component,
+                    mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                    0, msg_id, 1000000/hz, 0, 0, 0, 0, 0
+                )
+
+            with lock:
+                data["connected"] = True
+
+            while True:
+                msg = master.recv_match(blocking=True, timeout=2)
+
+                if msg is None:
+                    if time.time() - last_heartbeat > 10:
+                        raise TimeoutError("Heartbeat lost")
+                    continue
+
+                t = msg.get_type()
+
+                with lock:
+                    if t == "HEARTBEAT" and msg.get_srcComponent() == 1:
+                        last_heartbeat = time.time()
+                        data["mode"] = mavutil.mode_string_v10(msg)
+                        data["armed"] = bool(msg.base_mode & 128)
+
+                    elif t == "AUTOPILOT_VERSION":
+                        data["firmware"] = hex(msg.flight_sw_version)
+
+                    elif t == "ATTITUDE":
+                        data["roll"] = round(msg.roll * 57.2958, 2)
+                        data["pitch"] = round(msg.pitch * 57.2958, 2)
+                        data["yaw"] = round(msg.yaw * 57.2958 % 360, 2)
+
+                    elif t == "RAW_IMU":
+                        data["accel"] = [
+                            round(msg.xacc, 2),
+                            round(msg.yacc, 2),
+                            round(msg.zacc, 2)
+                        ]
+                        data["gyro"] = [
+                            round(msg.xgyro, 2),
+                            round(msg.ygyro, 2),
+                            round(msg.zgyro, 2)
+                        ]
+                        data["mag"] = [
+                            msg.xmag, msg.ymag, msg.zmag
+                        ]
+
+                    elif t == "SYS_STATUS":
+                        if msg.voltage_battery != 65535:
+                            data["battery"] = msg.voltage_battery / 1000
+
+                    elif t == "GPS_RAW_INT":
+                        data["gps_fix"] = msg.fix_type
+                        data["satellites"] = msg.satellites_visible
+
+                    elif t == "GLOBAL_POSITION_INT":
+                        data["lat"] = msg.lat / 1e7
+                        data["lon"] = msg.lon / 1e7
+                        data["alt"] = msg.relative_alt / 1000
+
+                    elif t == "RC_CHANNELS":
+                        data["rc"] = [
+                            getattr(msg, f"chan{i}_raw")
+                            for i in range(1, 9)
+                        ]
+
+                    elif t == "VFR_HUD":
+                        data["heading"] = msg.heading
+
+                    data["last_update"] = time.time()
+                    data["rates"][t] = data["rates"].get(t, 0) + 1
+
+        except Exception as e:
+            print("MAVLink:", e)
+
+        finally:
+            with lock:
+                data["connected"] = False
+            if master:
+                master.close()
+
+        time.sleep(3)
+
+
+Thread(target=worker, daemon=True).start()
+
+
+@app.get("/api/status")
+def status():
+    with lock:
+        return dict(data)
+
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Drone Live Monitor</title>
+<style>
+body{background:#0b1220;color:white;font-family:Arial;margin:0;padding:18px}
+h2{color:#38bdf8}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
+.card{background:#182438;padding:17px;border-radius:13px}
+.label{color:#9caec5;font-size:13px}
+.value{font-size:25px;font-weight:bold;margin-top:9px;color:#38bdf8}
+.small{font-size:14px;color:#ddd}
+.status{padding:12px;background:#182438;border-radius:10px;margin-bottom:15px}
+.full{grid-column:1/-1}
+@media(max-width:400px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<h2>DRONE LIVE MONITOR</h2>
+<div class="status">
+Connection: <b id="connected">Connecting...</b><br>
+Mode: <b id="mode">--</b> |
+Armed: <b id="armed">--</b><br>
+Firmware: <b id="firmware">--</b>
+</div>
+
+<div class="grid">
+<div class="card"><div class="label">ROLL</div><div class="value" id="roll">--</div></div>
+<div class="card"><div class="label">PITCH</div><div class="value" id="pitch">--</div></div>
+<div class="card full"><div class="label">YAW / HEADING</div><div class="value" id="yaw">--</div></div>
+
+<div class="card"><div class="label">GYRO X Y Z</div><div class="small" id="gyro">--</div></div>
+<div class="card"><div class="label">ACCEL X Y Z</div><div class="small" id="accel">--</div></div>
+<div class="card"><div class="label">COMPASS X Y Z</div><div class="small" id="mag">--</div></div>
+
+<div class="card"><div class="label">BATTERY</div><div class="value" id="battery">--</div></div>
+<div class="card"><div class="label">GPS FIX / SATELLITES</div><div class="value" id="gps">--</div></div>
+
+<div class="card full"><div class="label">GPS POSITION</div><div class="small" id="position">--</div></div>
+<div class="card full"><div class="label">RC CHANNELS</div><div class="small" id="rc">--</div></div>
+<div class="card full"><div class="label">LAST DATA RECEIVED</div><div class="value" id="update">--</div></div>
+</div>
+
+<script>
+async function refresh(){
+ try{
+  let d=await(await fetch('/api/status')).json();
+  const set=(id,v)=>document.getElementById(id).textContent=v;
+  set('connected',d.connected?'CONNECTED':'DISCONNECTED');
+  set('mode',d.mode);
+  set('armed',d.armed?'YES':'NO');
+  set('firmware',d.firmware);
+  set('roll',d.roll+'°');
+  set('pitch',d.pitch+'°');
+  set('yaw',d.yaw+'° | Heading: '+d.heading+'°');
+  set('gyro',d.gyro.join(' | '));
+  set('accel',d.accel.join(' | '));
+  set('mag',d.mag.join(' | '));
+  set('battery',d.battery===null?'No data':d.battery+' V');
+  set('gps','Fix '+d.gps_fix+' | '+d.satellites+' satellites');
+  set('position',d.lat===null?'No GPS position':
+    d.lat+', '+d.lon+' | Alt: '+d.alt+' m');
+  set('rc',d.rc.length?d.rc.join(' | '):'No RC data');
+  set('update',d.last_update?
+    (Date.now()/1000-d.last_update).toFixed(2)+' seconds ago':'Waiting');
+ }catch(e){}
+}
+setInterval(refresh,200);
+refresh();
+</script>
+</body>
+</html>
+"""
+

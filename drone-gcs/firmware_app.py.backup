@@ -1,0 +1,375 @@
+import os
+import re
+import sys
+import time
+import threading
+import subprocess
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+
+BASE = Path.home() / "drone-gcs"
+UPLOADER = BASE / "tools/uploader.py"
+FIRMWARE = BASE / "firmware/arducopter-pixhawk6c-stable.apj"
+PORT = "/dev/ttyACM0"
+EXPECTED_BOARD = 56
+
+app = FastAPI(title="ArduCopter Firmware Station")
+
+state = {
+    "status": "READY",
+    "message": "Ready to detect Pixhawk.",
+    "log": [],
+    "progress": 0,
+    "board": None,
+    "running": False,
+    "error": None
+}
+
+lock = threading.Lock()
+
+
+def add_log(line):
+    with lock:
+        state["log"].append(line.rstrip())
+        state["log"] = state["log"][-150:]
+
+
+def run_process(command, timeout=180):
+    return subprocess.run(
+        command,
+        cwd=BASE,
+        capture_output=True,
+        text=True,
+        timeout=timeout
+    )
+
+
+def detect_board():
+    if not Path(PORT).exists():
+        raise RuntimeError(f"{PORT} not found. Connect Pixhawk.")
+
+    result = run_process([
+        sys.executable,
+        str(UPLOADER),
+        "--port", PORT,
+        "--identify"
+    ], timeout=45)
+
+    output = result.stdout + "\n" + result.stderr
+
+    for line in output.splitlines():
+        add_log(line)
+
+    if result.returncode != 0:
+        raise RuntimeError("Bootloader identification failed.")
+
+    # Check the actual board type reported by the uploader.
+    match = re.search(
+        r"(?:board_type|Board type|Found board)\D*(\d+)",
+        output,
+        re.IGNORECASE
+    )
+
+    if not match:
+        raise RuntimeError(
+            "Could not reliably identify the Pixhawk board ID. "
+            "Check the server log."
+        )
+
+    board = int(match.group(1))
+
+    if board != EXPECTED_BOARD:
+        raise RuntimeError(
+            f"Wrong board detected: {board}. "
+            f"Expected Pixhawk 6C board ID {EXPECTED_BOARD}."
+        )
+
+    return board
+
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return HTML
+
+
+@app.get("/api/status")
+def get_status():
+    with lock:
+        return dict(state)
+
+
+@app.post("/api/detect")
+def detect():
+    with lock:
+        if state["running"]:
+            raise HTTPException(409, "An operation is already running.")
+        state.update({
+            "status": "DETECTING",
+            "message": "Detecting Pixhawk bootloader...",
+            "log": [],
+            "error": None,
+            "board": None
+        })
+        state["running"] = True
+
+    try:
+        board = detect_board()
+        with lock:
+            state.update({
+                "status": "DETECTED",
+                "message": "Pixhawk 6C detected. Firmware compatibility confirmed.",
+                "board": board
+            })
+        return {"success": True, "board": board}
+
+    except Exception as e:
+        with lock:
+            state.update({
+                "status": "FAILED",
+                "message": str(e),
+                "error": str(e)
+            })
+        raise HTTPException(500, str(e))
+
+    finally:
+        with lock:
+            state["running"] = False
+
+
+def flash_worker():
+    try:
+        with lock:
+            state.update({
+                "status": "DETECTING",
+                "message": "Checking Pixhawk bootloader...",
+                "progress": 0,
+                "log": [],
+                "error": None
+            })
+
+        board = detect_board()
+
+        with lock:
+            state["board"] = board
+            state["status"] = "FLASHING"
+            state["message"] = "Uploading official ArduCopter firmware..."
+
+        command = [
+            sys.executable,
+            str(UPLOADER),
+            "--port", PORT,
+            str(FIRMWARE)
+        ]
+
+        add_log("Starting official ArduPilot firmware uploader.")
+        add_log(f"Detected board ID: {board}")
+        add_log(f"Firmware: {FIRMWARE.name}")
+        add_log("Forced flashing is disabled.")
+
+        process = subprocess.Popen(
+            command,
+            cwd=BASE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+
+        for line in process.stdout:
+            line = line.rstrip()
+            add_log(line)
+
+            lower = line.lower()
+
+            with lock:
+                if "erase" in lower:
+                    state["status"] = "ERASING"
+                    state["message"] = "Erasing firmware area..."
+                    state["progress"] = max(state["progress"], 10)
+
+                elif "program" in lower:
+                    state["status"] = "PROGRAMMING"
+                    state["message"] = "Programming firmware..."
+                    state["progress"] = max(state["progress"], 25)
+
+                elif "verify" in lower:
+                    state["status"] = "VERIFYING"
+                    state["message"] = "Verifying firmware..."
+                    state["progress"] = max(state["progress"], 85)
+
+                elif "rebooting" in lower:
+                    state["status"] = "REBOOTING"
+                    state["message"] = "Rebooting Pixhawk..."
+                    state["progress"] = 95
+
+                # Capture percentage if uploader prints one.
+                pct = re.search(r"(\d{1,3})%", line)
+                if pct:
+                    state["progress"] = max(
+                        state["progress"],
+                        min(99, int(pct.group(1)))
+                    )
+
+        code = process.wait()
+
+        if code != 0:
+            raise RuntimeError(
+                f"Firmware uploader exited with code {code}."
+            )
+
+        with lock:
+            state.update({
+                "status": "SUCCESS",
+                "message": "Firmware upload and verification completed. Pixhawk rebooted.",
+                "progress": 100
+            })
+
+    except Exception as e:
+        add_log("ERROR: " + str(e))
+        with lock:
+            state.update({
+                "status": "FAILED",
+                "message": str(e),
+                "error": str(e)
+            })
+
+    finally:
+        with lock:
+            state["running"] = False
+
+
+@app.post("/api/flash")
+def flash():
+    with lock:
+        if state["running"]:
+            raise HTTPException(409, "An operation is already running.")
+
+        if not FIRMWARE.exists():
+            raise HTTPException(404, "ArduCopter firmware file not found.")
+
+        state["running"] = True
+        state["status"] = "STARTING"
+
+    threading.Thread(target=flash_worker, daemon=True).start()
+    return {"success": True}
+
+
+HTML = r"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ArduCopter Firmware Station</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#0b1020;color:#edf3ff;font-family:system-ui,sans-serif}
+header{padding:22px 5%;border-bottom:1px solid #283650;font-weight:750}
+header span{color:#548cff}
+main{max-width:760px;margin:55px auto;padding:20px}
+.card{background:#131b2e;border:1px solid #283650;border-radius:18px;padding:28px}
+h1{font-size:27px;margin:0 0 10px}
+.sub{color:#91a0b8;font-size:14px;line-height:1.6}
+.info{background:#19243a;padding:18px;border-radius:12px;margin:24px 0}
+.row{display:flex;justify-content:space-between;padding:9px 0;font-size:14px}
+.muted{color:#91a0b8}
+button{padding:14px 20px;border:0;border-radius:10px;font-weight:700;cursor:pointer}
+button:disabled{opacity:.4}
+.primary{background:#548cff;color:white}
+.secondary{background:#25334b;color:white}
+.progress{height:9px;background:#283650;border-radius:20px;overflow:hidden;margin:20px 0}
+.fill{height:100%;width:0;background:#31d49a;transition:width .3s}
+.status{padding:15px;background:#19243a;border-radius:10px;font-size:14px;margin:15px 0}
+.logs{background:#080d17;color:#9bb5d5;padding:15px;border-radius:10px;
+height:220px;overflow:auto;font:12px monospace;white-space:pre-wrap}
+.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:20px}
+.warning{color:#ffbd69;font-size:13px;line-height:1.6;margin-top:18px}
+.success{color:#31d49a}
+</style>
+</head>
+<body>
+<header>ROBERON <span>| FIRMWARE STATION</span></header>
+<main>
+<div class="card">
+<h1>ArduCopter Firmware</h1>
+<div class="sub">Official ArduPilot stable firmware for Holybro Pixhawk 6C.</div>
+
+<div class="info">
+<div class="row"><span class="muted">Flight controller</span><b>Pixhawk 6C</b></div>
+<div class="row"><span class="muted">Expected board ID</span><b>56</b></div>
+<div class="row"><span class="muted">Firmware</span><b>ArduCopter Stable</b></div>
+<div class="row"><span class="muted">Firmware file</span><b>Pixhawk6C .apj</b></div>
+<div class="row"><span class="muted">USB port</span><b>/dev/ttyACM0</b></div>
+</div>
+
+<div class="status" id="status">Ready. Detect your Pixhawk first.</div>
+<div class="progress"><div class="fill" id="fill"></div></div>
+
+<div class="actions">
+<button class="secondary" id="detect" onclick="detectBoard()">Detect Pixhawk</button>
+<button class="primary" id="flash" onclick="flashFirmware()" disabled>Upload ArduCopter</button>
+<button class="secondary" id="cal" onclick="location.href='http://192.168.0.2:8001'" hidden>Open Calibration</button>
+</div>
+
+<p class="warning">
+Warning: Firmware flashing interrupts normal flight-controller operation.
+Keep the drone disarmed, remove propellers and maintain stable USB power.
+Do not disconnect the Pixhawk during flashing.
+</p>
+
+<h3>Uploader output</h3>
+<div class="logs" id="logs">Waiting for operation...</div>
+</div>
+</main>
+<script>
+let busy=false;
+async function detectBoard(){
+ if(busy)return;
+ busy=true;
+ document.getElementById('detect').disabled=true;
+ document.getElementById('status').textContent='Detecting Pixhawk...';
+ try{
+  let r=await fetch('/api/detect',{method:'POST'});
+  let d=await r.json();
+  if(!r.ok)throw Error(d.detail||'Detection failed');
+  document.getElementById('status').textContent='Pixhawk 6C detected. Board ID 56 confirmed.';
+  document.getElementById('flash').disabled=false;
+ }catch(e){
+  document.getElementById('status').textContent=e.message;
+ }finally{
+  busy=false;
+  document.getElementById('detect').disabled=false;
+ }
+}
+async function flashFirmware(){
+ if(!confirm('Flash ArduCopter stable firmware to Pixhawk 6C? This will replace the installed firmware.'))return;
+ document.getElementById('flash').disabled=true;
+ document.getElementById('detect').disabled=true;
+ await fetch('/api/flash',{method:'POST'});
+}
+async function refresh(){
+ try{
+  let r=await fetch('/api/status',{cache:'no-store'});
+  let d=await r.json();
+  document.getElementById('status').textContent=d.message;
+  document.getElementById('fill').style.width=d.progress+'%';
+  document.getElementById('logs').textContent=(d.log||[]).join('\n');
+  document.getElementById('logs').scrollTop=999999;
+  if(d.status==='SUCCESS'){
+   document.getElementById('status').classList.add('success');
+   document.getElementById('cal').hidden=false;
+  }
+  if(d.status==='FAILED'){
+   document.getElementById('flash').disabled=false;
+   document.getElementById('detect').disabled=false;
+  }
+ }catch(e){}
+}
+setInterval(refresh,700);
+refresh();
+</script>
+</body>
+</html>
+"""

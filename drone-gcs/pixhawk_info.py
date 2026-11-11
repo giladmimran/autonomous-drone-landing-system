@@ -1,0 +1,64 @@
+from pymavlink import mavutil
+import time
+
+PORT = '/dev/serial/by-id/usb-Holybro_Pixhawk6C_2E0042001651333337363133-if00'
+
+print("\n===== PIXHAWK 6C DIAGNOSTICS =====")
+print("Connecting through", PORT)
+
+master = mavutil.mavlink_connection(PORT, baud=115200, source_system=255)
+
+if not master.wait_heartbeat(timeout=15):
+    print("ERROR: No heartbeat received.")
+    raise SystemExit(1)
+
+print("CONNECTED!")
+print("System ID:", master.target_system)
+print("Component ID:", master.target_component)
+
+master.mav.command_long_send(
+    master.target_system, master.target_component,
+    mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE, 0,
+    mavutil.mavlink.MAVLINK_MSG_ID_AUTOPILOT_VERSION,
+    0, 0, 0, 0, 0, 0
+)
+
+print("\n===== LIVE FLIGHT CONTROLLER DATA =====")
+
+end = time.time() + 15
+seen = set()
+
+while time.time() < end:
+    msg = master.recv_match(blocking=True, timeout=1)
+    if not msg:
+        continue
+
+    kind = msg.get_type()
+
+    if kind == "AUTOPILOT_VERSION" and kind not in seen:
+        seen.add(kind)
+        print("\nFirmware version:", hex(msg.flight_sw_version))
+        print("Board version:", msg.board_version)
+
+    elif kind == "HEARTBEAT":
+        print("Flight mode:", mavutil.mode_string_v10(msg))
+        print("Armed:", bool(msg.base_mode & 128))
+
+    elif kind == "SYS_STATUS" and kind not in seen:
+        seen.add(kind)
+        print("Battery voltage:", msg.voltage_battery / 1000, "V")
+
+    elif kind == "GPS_RAW_INT" and kind not in seen:
+        seen.add(kind)
+        print("GPS fix:", msg.fix_type)
+        print("Satellites:", msg.satellites_visible)
+
+    elif kind == "ATTITUDE" and kind not in seen:
+        seen.add(kind)
+        print("Attitude received: YES")
+        print("Roll:", round(msg.roll, 3))
+        print("Pitch:", round(msg.pitch, 3))
+        print("Yaw:", round(msg.yaw, 3))
+
+print("\n===== DIAGNOSTIC COMPLETE =====")
+master.close()
